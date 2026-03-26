@@ -1,0 +1,26 @@
+{
+  "MIN_PER_MIN": 10,
+  "MAX_PER_MIN": 50,
+  "CONCURRENT": 1,
+  "METHOD": "GET",
+  "TIMEOUT_MS": 5000,
+  "DEVICE_RATIO": 50,
+  "UNKNOWN_RATIO": 5,
+  "MIN_ACTIVE": 5,
+  "MAX_ACTIVE": 15,
+  "IDLE_ODDS": 0.7000000000000002,
+  "MIN_IDLE": 5,
+  "MAX_IDLE": 120,
+  "UNIQUE_IP_PROB": 0.95,
+  "PROXY_MODE": "service",
+  "PROXY_SERVICE_URL": "http://jEnsvDcblKIut4vU:FQ3pjJn3hgNqipWl@geo.iproyal.com:12321",
+  "PROXY_LIST_URL": "",
+  "PROXY_REFRESH_MIN": 5,
+  "URL_PARAMS": [
+    {
+      "key": "qr",
+      "value": "1",
+      "probability": 1
+    }
+  ]
+}
