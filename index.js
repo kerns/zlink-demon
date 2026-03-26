@@ -9,6 +9,7 @@ import { homedir } from "node:os";
 import logUpdate from "log-update";
 import chalk from "chalk";
 import { TrafficSimulator } from "hitmaker/simulator";
+import { loadConfig as loadHitmakerConfig } from "hitmaker/config";
 
 // ============================================================================
 // Config & Storage
@@ -84,14 +85,14 @@ function createPool() {
 
   async function addUrl(shortLink) {
     if (simulators.has(shortLink)) return;
-    const sim = new TrafficSimulator(shortLink);
+    const sim = new TrafficSimulator(shortLink, loadHitmakerConfig());
     await sim.proxyPool.init();
     simulators.set(shortLink, sim);
   }
 
   async function start() {
     isRunning = true;
-    const defaults = new TrafficSimulator("https://example.com").config;
+    const defaults = new TrafficSimulator("https://example.com", loadHitmakerConfig()).config;
 
     while (isRunning) {
       if (simulators.size === 0) {

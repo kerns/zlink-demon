@@ -12,8 +12,8 @@ importers:
         specifier: ^5.3.0
         version: 5.6.2
       hitmaker:
-        specifier: file:../hitmaker
-        version: file:../hitmaker
+        specifier: github:kerns/hitmaker
+        version: https://codeload.github.com/kerns/hitmaker/tar.gz/040027a9a0bb88548ecccd09a26c5645d64b5075
       log-update:
         specifier: ^6.1.0
         version: 6.1.0
@@ -64,8 +64,9 @@ packages:
     resolution: {integrity: sha512-CQ+bEO+Tva/qlmw24dCejulK5pMzVnUOFOijVogd3KQs07HnRIgp8TGipvCCRT06xeYEbpbgwaCxglFyiuIcmA==}
     engines: {node: '>=18'}
 
-  hitmaker@file:../hitmaker:
-    resolution: {directory: ../hitmaker, type: directory}
+  hitmaker@https://codeload.github.com/kerns/hitmaker/tar.gz/040027a9a0bb88548ecccd09a26c5645d64b5075:
+    resolution: {tarball: https://codeload.github.com/kerns/hitmaker/tar.gz/040027a9a0bb88548ecccd09a26c5645d64b5075}
+    version: 1.0.0
     engines: {node: '>=18.0.0'}
     hasBin: true
 
@@ -164,7 +165,7 @@ snapshots:
 
   get-east-asian-width@1.5.0: {}
 
-  hitmaker@file:../hitmaker:
+  hitmaker@https://codeload.github.com/kerns/hitmaker/tar.gz/040027a9a0bb88548ecccd09a26c5645d64b5075:
     dependencies:
       chalk: 5.6.2
       http-proxy-agent: 7.0.2
