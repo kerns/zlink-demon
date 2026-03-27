@@ -231,6 +231,7 @@ let poller = null;
 let logs = [];
 let startTime = null;
 let timeoutTimer = null;
+let renderIntervalId = null;
 
 function addLog(msg) {
   logs.push(msg);
@@ -238,43 +239,115 @@ function addLog(msg) {
 }
 
 // ============================================================================
-// Hitmaker config editor (shells out to hitmaker --config)
+// Hitmaker update + config editor
 // ============================================================================
+
+// Resolve the zlink-demon package directory for running pnpm commands
+const DEMON_DIR = new URL(".", import.meta.url).pathname.replace(/\/$/, "");
 
 let hitmakerConfigOpen = false;
 
 /**
- * Pause the demon's TUI, hand the terminal to hitmaker's config editor,
- * then resume when the user exits. Changes are persisted by hitmaker itself
- * and picked up on the next getHitmakerConfig() call.
+ * Update hitmaker to the latest version from GitHub, then re-exec the
+ * demon process so the new code is loaded. Node caches modules in memory,
+ * so a simple update-in-place wouldn't take effect without a restart.
+ */
+function updateHitmaker() {
+  if (hitmakerConfigOpen) return;
+  hitmakerConfigOpen = true;
+
+  if (renderIntervalId) clearInterval(renderIntervalId);
+  logUpdate.clear();
+
+  process.stdin.removeListener("keypress", handleKeypress);
+  process.stdin.setRawMode(false);
+  process.stdin.pause();
+
+  console.log(chalk.cyan("\n  Updating hitmaker...\n"));
+
+  const child = spawn("pnpm", ["update", "hitmaker"], {
+    cwd: DEMON_DIR,
+    stdio: "inherit",
+  });
+
+  child.on("close", (code) => {
+    if (code === 0) {
+      console.log(chalk.green("\n  Updated. Restarting...\n"));
+      // Re-exec this process with the same arguments so the new code loads
+      setTimeout(() => {
+        process.stdin.setRawMode(false);
+        spawn(process.execPath, process.argv.slice(1), {
+          cwd: process.cwd(),
+          stdio: "inherit",
+          detached: false,
+        }).on("close", (c) => process.exit(c));
+      }, 500);
+    } else {
+      console.log(chalk.red(`\n  Update failed (exit ${code})\n`));
+      hitmakerConfigOpen = false;
+      process.stdin.resume();
+      process.stdin.setRawMode(true);
+      process.stdin.on("keypress", handleKeypress);
+      if (state === "running") {
+        renderIntervalId = setInterval(render, 1000);
+      }
+      render();
+    }
+  });
+
+  child.on("error", (err) => {
+    console.log(chalk.red(`\n  Update error: ${err.message}\n`));
+    hitmakerConfigOpen = false;
+    process.stdin.resume();
+    process.stdin.setRawMode(true);
+    process.stdin.on("keypress", handleKeypress);
+    if (state === "running") {
+      renderIntervalId = setInterval(render, 1000);
+    }
+    render();
+  });
+}
+
+/**
+ * Fully suspend the demon's TUI and hand the terminal to hitmaker's config
+ * editor. We must: stop the render interval (prevents logUpdate writes),
+ * pause stdin (stops the parent's readline from consuming keystrokes that
+ * belong to the child), and drop raw mode so the child can set it up fresh.
+ * On exit, everything is restored and the demon resumes.
  */
 function openHitmakerConfig() {
   if (hitmakerConfigOpen) return;
   hitmakerConfigOpen = true;
 
-  // Tear down our TUI so hitmaker gets a clean terminal
+  // Stop our render loop so logUpdate doesn't fight the child's output
+  if (renderIntervalId) clearInterval(renderIntervalId);
   logUpdate.clear();
+
+  // Detach our keypress listener and pause stdin so the child process
+  // gets exclusive access to the terminal input
   process.stdin.removeListener("keypress", handleKeypress);
   process.stdin.setRawMode(false);
+  process.stdin.pause();
 
   const child = spawn(process.execPath, [HITMAKER_CLI, "--config"], {
     stdio: "inherit",
   });
 
-  child.on("close", () => {
-    // Restore our TUI
+  function restore() {
+    hitmakerConfigOpen = false;
+    process.stdin.resume();
     process.stdin.setRawMode(true);
     process.stdin.on("keypress", handleKeypress);
-    hitmakerConfigOpen = false;
+    if (state === "running") {
+      renderIntervalId = setInterval(render, 1000);
+    }
     render();
-  });
+  }
 
+  child.on("close", restore);
   child.on("error", (err) => {
     addLog(`Config editor error: ${err.message}`);
-    process.stdin.setRawMode(true);
-    process.stdin.on("keypress", handleKeypress);
-    hitmakerConfigOpen = false;
-    render();
+    restore();
   });
 }
 
@@ -306,7 +379,8 @@ function renderKeySelect() {
   lines.push("");
   if (errorMessage) lines.push(chalk.red(`  ${errorMessage}`));
   lines.push("");
-  lines.push("  " + chalk.white("↑/↓") + chalk.gray(" Navigate") + "  " + chalk.white("Enter") + chalk.gray(" Select") + "  " + chalk.white("D") + chalk.gray(" Delete") + "  " + chalk.white("C") + chalk.gray(" Config") + "  " + chalk.white("Q") + chalk.gray(" Quit"));
+  lines.push("  " + chalk.white("↑/↓") + chalk.gray(" Navigate") + "  " + chalk.white("Enter") + chalk.gray(" Select") + "  " + chalk.white("D") + chalk.gray(" Delete"));
+  lines.push("  " + chalk.white("C") + chalk.gray(" Config") + "  " + chalk.white("U") + chalk.gray(" Update Hitmaker") + "  " + chalk.white("Q") + chalk.gray(" Quit"));
   lines.push("");
   return lines.join("\n");
 }
@@ -603,7 +677,7 @@ function startDaemon() {
   pollLoop();
 
   // Render loop
-  setInterval(render, 1000);
+  renderIntervalId = setInterval(render, 1000);
   render();
 }
 
@@ -677,6 +751,9 @@ function handleKeypress(str, key) {
         }
       } else if (str === "c" || str === "C") {
         openHitmakerConfig();
+        return;
+      } else if (str === "u" || str === "U") {
+        updateHitmaker();
         return;
       } else if (str === "q" || str === "Q") {
         process.exit(0);
