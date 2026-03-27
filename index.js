@@ -6,10 +6,16 @@ import readline from "node:readline";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import logUpdate from "log-update";
 import chalk from "chalk";
 import { TrafficSimulator } from "hitmaker/simulator";
-import { loadConfig as loadHitmakerConfig } from "hitmaker/config";
+import { getConfig as getHitmakerConfig } from "hitmaker/config";
+
+// Resolve hitmaker CLI entry point from the installed package
+const require = createRequire(import.meta.url);
+const HITMAKER_CLI = require.resolve("hitmaker");
 
 // ============================================================================
 // Config & Storage
@@ -85,14 +91,14 @@ function createPool() {
 
   async function addUrl(shortLink) {
     if (simulators.has(shortLink)) return;
-    const sim = new TrafficSimulator(shortLink, loadHitmakerConfig());
+    const sim = new TrafficSimulator(shortLink, getHitmakerConfig());
     await sim.proxyPool.init();
     simulators.set(shortLink, sim);
   }
 
   async function start() {
     isRunning = true;
-    const defaults = new TrafficSimulator("https://example.com", loadHitmakerConfig()).config;
+    const defaults = new TrafficSimulator("https://example.com", getHitmakerConfig()).config;
 
     while (isRunning) {
       if (simulators.size === 0) {
@@ -232,6 +238,47 @@ function addLog(msg) {
 }
 
 // ============================================================================
+// Hitmaker config editor (shells out to hitmaker --config)
+// ============================================================================
+
+let hitmakerConfigOpen = false;
+
+/**
+ * Pause the demon's TUI, hand the terminal to hitmaker's config editor,
+ * then resume when the user exits. Changes are persisted by hitmaker itself
+ * and picked up on the next getHitmakerConfig() call.
+ */
+function openHitmakerConfig() {
+  if (hitmakerConfigOpen) return;
+  hitmakerConfigOpen = true;
+
+  // Tear down our TUI so hitmaker gets a clean terminal
+  logUpdate.clear();
+  process.stdin.removeListener("keypress", handleKeypress);
+  process.stdin.setRawMode(false);
+
+  const child = spawn(process.execPath, [HITMAKER_CLI, "--config"], {
+    stdio: "inherit",
+  });
+
+  child.on("close", () => {
+    // Restore our TUI
+    process.stdin.setRawMode(true);
+    process.stdin.on("keypress", handleKeypress);
+    hitmakerConfigOpen = false;
+    render();
+  });
+
+  child.on("error", (err) => {
+    addLog(`Config editor error: ${err.message}`);
+    process.stdin.setRawMode(true);
+    process.stdin.on("keypress", handleKeypress);
+    hitmakerConfigOpen = false;
+    render();
+  });
+}
+
+// ============================================================================
 // Renderers
 // ============================================================================
 
@@ -259,7 +306,7 @@ function renderKeySelect() {
   lines.push("");
   if (errorMessage) lines.push(chalk.red(`  ${errorMessage}`));
   lines.push("");
-  lines.push("  " + chalk.white("↑/↓") + chalk.gray(" Navigate") + "  " + chalk.white("Enter") + chalk.gray(" Select") + "  " + chalk.white("D") + chalk.gray(" Delete") + "  " + chalk.white("Q") + chalk.gray(" Quit"));
+  lines.push("  " + chalk.white("↑/↓") + chalk.gray(" Navigate") + "  " + chalk.white("Enter") + chalk.gray(" Select") + "  " + chalk.white("D") + chalk.gray(" Delete") + "  " + chalk.white("C") + chalk.gray(" Config") + "  " + chalk.white("Q") + chalk.gray(" Quit"));
   lines.push("");
   return lines.join("\n");
 }
@@ -386,8 +433,20 @@ function renderRunning() {
     lines.push(chalk.gray("  Polling for new links every 5s..."));
   }
 
+  // Active hitmaker config summary
+  const hmConfig = getHitmakerConfig();
+  lines.push(chalk.gray("  " + "─".repeat(55)));
+  const proxyLabel = { none: "off", free: "free", url: "list", service: "service" }[hmConfig.PROXY_MODE] || hmConfig.PROXY_MODE;
+  lines.push(
+    chalk.gray("  ") + chalk.dim("Config: ") +
+    chalk.dim(`${hmConfig.MIN_PER_MIN}–${hmConfig.MAX_PER_MIN}/min`) +
+    chalk.dim(` │ active ${hmConfig.MIN_ACTIVE}–${hmConfig.MAX_ACTIVE}m`) +
+    chalk.dim(` │ idle ${hmConfig.MIN_IDLE}–${hmConfig.MAX_IDLE}m @${(hmConfig.IDLE_ODDS * 100).toFixed(0)}%`) +
+    chalk.dim(` │ proxy: ${proxyLabel}`),
+  );
+
   lines.push("");
-  lines.push("  " + chalk.white("Q") + chalk.gray(" Quit"));
+  lines.push("  " + chalk.white("C") + chalk.gray(" Config") + "  " + chalk.white("Q") + chalk.gray(" Quit"));
   lines.push("");
   return lines.join("\n");
 }
@@ -616,6 +675,9 @@ function handleKeypress(str, key) {
             if (cursor >= keyChoices().length) cursor = Math.max(0, keyChoices().length - 1);
           }
         }
+      } else if (str === "c" || str === "C") {
+        openHitmakerConfig();
+        return;
       } else if (str === "q" || str === "Q") {
         process.exit(0);
       }
@@ -678,7 +740,10 @@ function handleKeypress(str, key) {
     }
 
     case "running": {
-      if (str === "q" || str === "Q") {
+      if (str === "c" || str === "C") {
+        openHitmakerConfig();
+        return;
+      } else if (str === "q" || str === "Q") {
         shutdown();
       }
       break;
