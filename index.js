@@ -188,7 +188,7 @@ function createPoller(apiUrl, apiKey, workspaceSlugs) {
 // UI State Machine
 // ============================================================================
 
-// States: key_select, key_input, key_validating, workspace_select, duration_select, running
+// States: key_select, key_input, key_validating, workspace_select, mode_select, duration_select, running
 let state = "key_select";
 let textInput = "";
 let cursor = 0;
@@ -200,6 +200,7 @@ let apiUrl = null;
 let apiKey = null;
 let userInfo = null;
 let selectedWorkspaces = [];
+let includeExisting = false;
 let timeoutMinutes = 0;
 
 // Key selection
@@ -212,6 +213,12 @@ const keyChoices = () => [
 // Workspace selection
 let workspaceChoices = [];
 let wsSelected = new Set();
+
+// Mode
+const MODES = [
+  { label: "New links only", value: false },
+  { label: "All links (existing + new)", value: true },
+];
 
 // Duration
 const DURATIONS = [
@@ -428,6 +435,26 @@ function renderWorkspaceSelect() {
   return lines.join("\n");
 }
 
+function renderModeSelect() {
+  const lines = ["", renderHeader(), ""];
+  lines.push(chalk.bold("  Include existing links?"));
+  lines.push("");
+
+  MODES.forEach((m, i) => {
+    const prefix = i === cursor ? chalk.cyan("  ❯ ") : "    ";
+    if (i === cursor) {
+      lines.push(prefix + chalk.white(m.label));
+    } else {
+      lines.push(prefix + chalk.gray(m.label));
+    }
+  });
+
+  lines.push("");
+  lines.push("  " + chalk.white("↑/↓") + chalk.gray(" Navigate") + "  " + chalk.white("Enter") + chalk.gray(" Select"));
+  lines.push("");
+  return lines.join("\n");
+}
+
 function renderDurationSelect() {
   const lines = ["", renderHeader(), ""];
   lines.push(chalk.bold("  How long should it run?"));
@@ -457,6 +484,7 @@ function renderRunning() {
   const remaining = timeoutMinutes > 0 ? Math.max(0, timeoutMinutes - elapsed) : null;
   const timeLabel = remaining !== null ? `${remaining}min left` : `${elapsed}min elapsed`;
 
+  const modeLabel = includeExisting ? chalk.magenta("all") : chalk.dim("new");
   const phaseIcon = stats.phase === "active" ? chalk.green("●") : stats.phase === "idle" ? chalk.yellow("○") : chalk.gray("◌");
   const phaseLabel = stats.phase === "active"
     ? chalk.green(`Active ~${stats.phaseRate}/min (${stats.phaseRemaining}min)`)
@@ -466,6 +494,7 @@ function renderRunning() {
 
   lines.push(
     chalk.gray(`  ${phaseIcon} ${phaseLabel}`) +
+    chalk.gray(` │ Mode: `) + modeLabel +
     chalk.gray(` │ URLs: ${stats.urlCount}`) +
     chalk.gray(` │ Hits: ${stats.totalHits}`) +
     (stats.totalErrors > 0 ? chalk.red(` │ Err: ${stats.totalErrors}`) : "") +
@@ -510,7 +539,7 @@ function renderRunning() {
   // Active hitmaker config summary
   const hmConfig = getHitmakerConfig();
   lines.push(chalk.gray("  " + "─".repeat(55)));
-  const proxyLabel = { none: "off", free: "free", url: "list", service: "service" }[hmConfig.PROXY_MODE] || hmConfig.PROXY_MODE;
+  const proxyLabel = { none: "off", free: "free", url: "list", service: "paid" }[hmConfig.PROXY_MODE] || hmConfig.PROXY_MODE;
   lines.push(
     chalk.gray("  ") + chalk.dim("Config: ") +
     chalk.dim(`${hmConfig.MIN_PER_MIN}–${hmConfig.MAX_PER_MIN}/min`) +
@@ -531,6 +560,7 @@ function render() {
     case "key_input": logUpdate(renderKeyInput()); break;
     case "key_validating": logUpdate(renderValidating()); break;
     case "workspace_select": logUpdate(renderWorkspaceSelect()); break;
+    case "mode_select": logUpdate(renderModeSelect()); break;
     case "duration_select": logUpdate(renderDurationSelect()); break;
     case "running": logUpdate(renderRunning()); break;
   }
@@ -612,8 +642,8 @@ function transitionToWorkspaceSelect() {
     // Auto-select single workspace
     wsSelected.add(0);
     selectedWorkspaces = [workspaceChoices[0]];
-    cursor = 3; // default to 30 min
-    state = "duration_select";
+    cursor = 0;
+    state = "mode_select";
     render();
     return;
   }
@@ -649,6 +679,30 @@ function startDaemon() {
     addLog(args.join(" ").slice(0, 100));
   };
 
+  // Seed pool with existing links if requested
+  if (includeExisting) {
+    (async () => {
+      for (const ws of selectedWorkspaces) {
+        try {
+          addLog(`Fetching existing links for ${ws.slug}...`);
+          const params = new URLSearchParams({ sortBy: "createdAt", sortOrder: "desc", limit: "100" });
+          const body = await apiRequest(apiUrl, `/links?${params}`, apiKey, ws.slug);
+          const links = body.data || [];
+          for (const link of links) {
+            let url = link.shortLink;
+            if (apiUrl === API_ENVIRONMENTS[0].url && url.startsWith("https://")) {
+              url = url.replace("https://", "http://");
+            }
+            await pool.addUrl(url);
+          }
+          addLog(`Loaded ${links.length} existing links from ${ws.slug}`);
+        } catch (err) {
+          addLog(`Failed to fetch existing links for ${ws.slug}: ${err.message}`);
+        }
+      }
+    })();
+  }
+
   pool.start().catch((err) => addLog(`Pool error: ${err.message}`));
 
   // Timeout
@@ -665,8 +719,13 @@ function startDaemon() {
       try {
         const newLinks = await poller.poll();
         for (const link of newLinks) {
-          addLog(`NEW: ${link.shortLink} (${link.workspace})`);
-          await pool.addUrl(link.shortLink);
+          let url = link.shortLink;
+          // Dev environment doesn't run HTTPS — downgrade short links
+          if (apiUrl === API_ENVIRONMENTS[0].url && url.startsWith("https://")) {
+            url = url.replace("https://", "http://");
+          }
+          addLog(`NEW: ${url} (${link.workspace})`);
+          await pool.addUrl(url);
         }
       } catch (err) {
         addLog(`Poll error: ${err.message}`);
@@ -795,6 +854,20 @@ function handleKeypress(str, key) {
       } else if (key.name === "return") {
         if (wsSelected.size === 0) wsSelected.add(cursor);
         selectedWorkspaces = Array.from(wsSelected).map((i) => workspaceChoices[i]);
+        cursor = 0;
+        state = "mode_select";
+      }
+      render();
+      break;
+    }
+
+    case "mode_select": {
+      if (key.name === "up") {
+        cursor = (cursor - 1 + MODES.length) % MODES.length;
+      } else if (key.name === "down") {
+        cursor = (cursor + 1) % MODES.length;
+      } else if (key.name === "return") {
+        includeExisting = MODES[cursor].value;
         cursor = 3; // default 30 min
         state = "duration_select";
       }
