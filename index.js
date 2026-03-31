@@ -98,17 +98,22 @@ function createPool() {
 
   async function start() {
     isRunning = true;
-    const defaults = new TrafficSimulator("https://example.com", getHitmakerConfig()).config;
 
     while (isRunning) {
+      // Re-read config each phase so hitmaker config changes take effect
+      const cfg = getHitmakerConfig();
+      for (const sim of simulators.values()) {
+        sim.config = { ...sim.config, ...cfg };
+      }
+
       if (simulators.size === 0) {
         phase = "waiting";
         await sleep(1000);
         continue;
       }
 
-      const rate = randInt(defaults.MIN_PER_MIN, defaults.MAX_PER_MIN);
-      const activeMinutes = randInt(defaults.MIN_ACTIVE, defaults.MAX_ACTIVE);
+      const rate = randInt(cfg.MIN_PER_MIN, cfg.MAX_PER_MIN);
+      const activeMinutes = randInt(cfg.MIN_ACTIVE, cfg.MAX_ACTIVE);
       phaseEnd = Date.now() + activeMinutes * 60_000;
       phase = "active";
       phaseRate = rate;
@@ -127,8 +132,8 @@ function createPool() {
         await sleep(Math.max(50, intervalMs + jitter));
       }
 
-      if (Math.random() < defaults.IDLE_ODDS && isRunning) {
-        const idleMinutes = randInt(defaults.MIN_IDLE, defaults.MAX_IDLE);
+      if (Math.random() < cfg.IDLE_ODDS && isRunning) {
+        const idleMinutes = randInt(cfg.MIN_IDLE, cfg.MAX_IDLE);
         phaseEnd = Date.now() + idleMinutes * 60_000;
         phase = "idle";
         phaseRate = 0;
