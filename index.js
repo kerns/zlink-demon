@@ -10,12 +10,50 @@ import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import logUpdate from "log-update";
 import chalk from "chalk";
-import { TrafficSimulator } from "hitmaker/simulator";
-import { getConfig as getHitmakerConfig } from "hitmaker/config";
+// ---------------------------------------------------------------------------
+// Hitmaker – treated as an external dependency (not bundled).
+// We dynamically import its modules so we can show a friendly install message
+// instead of crashing if it isn't installed.
+// ---------------------------------------------------------------------------
 
-// Resolve hitmaker CLI entry point from the installed package
-const require = createRequire(import.meta.url);
-const HITMAKER_CLI = require.resolve("hitmaker");
+let TrafficSimulator;
+let getHitmakerConfig;
+let HITMAKER_CLI;
+
+async function loadHitmaker() {
+  try {
+    const simMod = await import("hitmaker/simulator");
+    const cfgMod = await import("hitmaker/config");
+    TrafficSimulator = simMod.TrafficSimulator;
+    getHitmakerConfig = cfgMod.getConfig;
+
+    const require = createRequire(import.meta.url);
+    HITMAKER_CLI = require.resolve("hitmaker");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function printHitmakerMissing() {
+  console.error("");
+  console.error(chalk.red.bold("  hitmaker is not installed"));
+  console.error("");
+  console.error(chalk.white("  zlink-demon requires hitmaker to generate traffic."));
+  console.error(chalk.white("  Install it with one of the following commands:"));
+  console.error("");
+  console.error(chalk.cyan("    npm install -g hitmaker"));
+  console.error(chalk.cyan("    pnpm add -g hitmaker"));
+  console.error(chalk.cyan("    bun add -g hitmaker"));
+  console.error("");
+  console.error(chalk.dim("  Or install locally in this project:"));
+  console.error("");
+  console.error(chalk.cyan("    npm install hitmaker"));
+  console.error(chalk.cyan("    pnpm add hitmaker"));
+  console.error(chalk.cyan("    bun add hitmaker"));
+  console.error("");
+  process.exit(1);
+}
 
 // ============================================================================
 // Config & Storage
@@ -122,14 +160,18 @@ function createPool() {
         if (simulators.size === 0) { await sleep(1000); continue; }
         const entries = Array.from(simulators.values());
         const sim = entries[Math.floor(Math.random() * entries.length)];
+        const hitStart = Date.now();
         try {
           const result = await sim.doHit(1);
           totalHits++;
           if (!result.success) totalErrors++;
         } catch { totalErrors++; }
+        // Subtract the time doHit took so we maintain the target rate
+        const hitDuration = Date.now() - hitStart;
         const intervalMs = 60_000 / rate;
         const jitter = intervalMs * (Math.random() * 0.2 - 0.1);
-        await sleep(Math.max(50, intervalMs + jitter));
+        const remaining = intervalMs + jitter - hitDuration;
+        await sleep(Math.max(50, remaining));
       }
 
       if (Math.random() < cfg.IDLE_ODDS && isRunning) {
@@ -193,7 +235,7 @@ function createPoller(apiUrl, apiKey, workspaceSlugs) {
 // UI State Machine
 // ============================================================================
 
-// States: key_select, key_input, key_validating, workspace_select, mode_select, duration_select, running
+// States: key_select, key_input, key_validating, key_label, workspace_select, mode_select, duration_select, running
 let state = "key_select";
 let textInput = "";
 let cursor = 0;
@@ -209,6 +251,8 @@ let includeExisting = false;
 let timeoutMinutes = 0;
 
 // Key selection
+let pendingKeyEntry = null; // holds key entry during label step
+let pendingDelete = false; // true when waiting for D confirmation
 const savedKeys = loadKeys();
 const keyChoices = () => [
   ...savedKeys.map((k) => ({ label: k.label, env: k.env, value: k })),
@@ -260,9 +304,10 @@ const DEMON_DIR = new URL(".", import.meta.url).pathname.replace(/\/$/, "");
 let hitmakerConfigOpen = false;
 
 /**
- * Update hitmaker to the latest version from GitHub, then re-exec the
- * demon process so the new code is loaded. Node caches modules in memory,
- * so a simple update-in-place wouldn't take effect without a restart.
+ * Update hitmaker to the latest version. Detects whether hitmaker was
+ * installed locally (in this project) or globally, and runs the
+ * appropriate update command. Re-execs the daemon afterward so the
+ * new code is loaded (Node caches modules in memory).
  */
 function updateHitmaker() {
   if (hitmakerConfigOpen) return;
@@ -275,10 +320,17 @@ function updateHitmaker() {
   process.stdin.setRawMode(false);
   process.stdin.pause();
 
-  console.log(chalk.cyan("\n  Updating hitmaker...\n"));
+  // Detect if hitmaker is installed locally or globally
+  const localHitmaker = existsSync(join(DEMON_DIR, "node_modules", "hitmaker"));
+  const updateArgs = localHitmaker
+    ? ["update", "hitmaker"]
+    : ["add", "-g", "hitmaker@latest"];
+  const updateCwd = localHitmaker ? DEMON_DIR : undefined;
 
-  const child = spawn("pnpm", ["update", "hitmaker"], {
-    cwd: DEMON_DIR,
+  console.log(chalk.cyan(`\n  Updating hitmaker (${localHitmaker ? "local" : "global"})...\n`));
+
+  const child = spawn("pnpm", updateArgs, {
+    cwd: updateCwd,
     stdio: "inherit",
   });
 
@@ -389,9 +441,10 @@ function renderKeySelect() {
   });
 
   lines.push("");
-  if (errorMessage) lines.push(chalk.red(`  ${errorMessage}`));
+  if (pendingDelete && statusMessage) lines.push(chalk.yellow(`  ${statusMessage}`));
+  else if (errorMessage) lines.push(chalk.red(`  ${errorMessage}`));
   lines.push("");
-  lines.push("  " + chalk.white("↑/↓") + chalk.gray(" Navigate") + "  " + chalk.white("Enter") + chalk.gray(" Select") + "  " + chalk.white("D") + chalk.gray(" Delete"));
+  lines.push("  " + chalk.white("↑/↓") + chalk.gray(" Navigate") + "  " + chalk.white("Enter") + chalk.gray(" Select") + "  " + chalk.white("D") + chalk.gray(" Remove"));
   lines.push("  " + chalk.white("C") + chalk.gray(" Config") + "  " + chalk.white("U") + chalk.gray(" Update Hitmaker") + "  " + chalk.white("Q") + chalk.gray(" Quit"));
   lines.push("");
   return lines.join("\n");
@@ -415,6 +468,19 @@ function renderValidating() {
   const lines = ["", renderHeader(), ""];
   lines.push("");
   lines.push(chalk.dim(`  ${statusMessage || "Validating..."}`));
+  lines.push("");
+  return lines.join("\n");
+}
+
+function renderKeyLabel() {
+  const lines = ["", renderHeader(), ""];
+  lines.push(chalk.green("  ✓ Key validated") + chalk.dim(` — ${pendingKeyEntry?.label || ""}`));
+  lines.push("");
+  lines.push(chalk.bold("  Add a label or note?") + chalk.dim(" (optional)"));
+  lines.push("");
+  lines.push("  " + chalk.bgGray.white(` ${textInput || " "}_ `));
+  lines.push("");
+  lines.push("  " + chalk.white("Enter") + chalk.gray(" Save") + "  " + chalk.white("Esc") + chalk.gray(" Skip (use default)"));
   lines.push("");
   return lines.join("\n");
 }
@@ -564,6 +630,7 @@ function render() {
     case "key_select": logUpdate(renderKeySelect()); break;
     case "key_input": logUpdate(renderKeyInput()); break;
     case "key_validating": logUpdate(renderValidating()); break;
+    case "key_label": logUpdate(renderKeyLabel()); break;
     case "workspace_select": logUpdate(renderWorkspaceSelect()); break;
     case "mode_select": logUpdate(renderModeSelect()); break;
     case "duration_select": logUpdate(renderDurationSelect()); break;
@@ -588,21 +655,13 @@ async function validateAndProceed(key) {
       apiUrl = env.url;
       apiKey = key;
 
-      // Auto-save
+      // Prepare entry and prompt for optional label
       const userName = userInfo.name || userInfo.email.split("@")[0];
-      const label = `${userName} (${env.name})`;
-      const keys = loadKeys();
-      const entry = { label, key, email: userInfo.email, env: env.name, apiUrl };
-      const existing = keys.findIndex((k) => k.key === key);
-      if (existing >= 0) keys[existing] = entry;
-      else keys.push(entry);
-      saveKeys(keys);
-
-      // Reload savedKeys
-      savedKeys.length = 0;
-      savedKeys.push(...loadKeys());
-
-      transitionToWorkspaceSelect();
+      const defaultLabel = `${userName} (${env.name})`;
+      pendingKeyEntry = { label: defaultLabel, key, email: userInfo.email, env: env.name, apiUrl };
+      textInput = "";
+      state = "key_label";
+      render();
       return;
     } catch {
       // Try next env
@@ -612,6 +671,25 @@ async function validateAndProceed(key) {
   errorMessage = "Key not valid on dev or prod";
   state = "key_input";
   render();
+}
+
+function savePendingKey() {
+  if (!pendingKeyEntry) return;
+  // If user typed a custom label, use it; otherwise keep the default
+  if (textInput.trim()) {
+    pendingKeyEntry.label = textInput.trim();
+  }
+  const keys = loadKeys();
+  const existing = keys.findIndex((k) => k.key === pendingKeyEntry.key);
+  if (existing >= 0) keys[existing] = pendingKeyEntry;
+  else keys.push(pendingKeyEntry);
+  saveKeys(keys);
+
+  // Reload savedKeys
+  savedKeys.length = 0;
+  savedKeys.push(...loadKeys());
+  pendingKeyEntry = null;
+  textInput = "";
 }
 
 async function validateStoredKey(stored) {
@@ -786,9 +864,12 @@ function handleKeypress(str, key) {
       const choices = keyChoices();
       if (key.name === "up") {
         cursor = (cursor - 1 + choices.length) % choices.length;
+        pendingDelete = false;
       } else if (key.name === "down") {
         cursor = (cursor + 1) % choices.length;
+        pendingDelete = false;
       } else if (key.name === "return") {
+        pendingDelete = false;
         const choice = choices[cursor];
         if (choice.value === null) {
           // Add new key
@@ -800,20 +881,29 @@ function handleKeypress(str, key) {
           return; // async — will render when done
         }
       } else if (str === "d" || str === "D") {
-        // Delete selected key
         const choice = choices[cursor];
         if (choice.value) {
-          const keys = loadKeys();
-          const idx = keys.findIndex((k) => k.key === choice.value.key);
-          if (idx >= 0) {
-            keys.splice(idx, 1);
-            saveKeys(keys);
-            savedKeys.length = 0;
-            savedKeys.push(...keys);
-            if (cursor >= keyChoices().length) cursor = Math.max(0, keyChoices().length - 1);
+          if (!pendingDelete) {
+            // First press — ask for confirmation
+            pendingDelete = true;
+            statusMessage = `Press D again to remove "${choice.label}"`;
+          } else {
+            // Second press — delete
+            pendingDelete = false;
+            statusMessage = "";
+            const keys = loadKeys();
+            const idx = keys.findIndex((k) => k.key === choice.value.key);
+            if (idx >= 0) {
+              keys.splice(idx, 1);
+              saveKeys(keys);
+              savedKeys.length = 0;
+              savedKeys.push(...keys);
+              if (cursor >= keyChoices().length) cursor = Math.max(0, keyChoices().length - 1);
+            }
           }
         }
       } else if (str === "c" || str === "C") {
+        pendingDelete = false;
         openHitmakerConfig();
         return;
       } else if (str === "u" || str === "U") {
@@ -836,6 +926,21 @@ function handleKeypress(str, key) {
           validateAndProceed(textInput.trim());
           return; // async
         }
+      } else if (key.name === "backspace") {
+        textInput = textInput.slice(0, -1);
+      } else if (str && !key.ctrl && !key.meta && str.length === 1) {
+        textInput += str;
+      }
+      render();
+      break;
+    }
+
+    case "key_label": {
+      if (key.name === "return" || key.name === "escape") {
+        // Enter saves with custom label (or default if empty); Esc skips (uses default)
+        savePendingKey();
+        transitionToWorkspaceSelect();
+        return;
       } else if (key.name === "backspace") {
         textInput = textInput.slice(0, -1);
       } else if (str && !key.ctrl && !key.meta && str.length === 1) {
@@ -910,19 +1015,25 @@ function handleKeypress(str, key) {
 // Entry point
 // ============================================================================
 
-if (process.stdin.isTTY) {
-  readline.emitKeypressEvents(process.stdin);
-  process.stdin.setRawMode(true);
-  process.stdin.on("keypress", handleKeypress);
-} else {
-  console.error("zlink-demon requires a terminal (TTY)");
-  process.exit(1);
-}
+// Boot: ensure hitmaker is available, then start the TUI
+(async () => {
+  const hitmakerOk = await loadHitmaker();
+  if (!hitmakerOk) printHitmakerMissing();
 
-// Handle no saved keys — go straight to key input
-if (savedKeys.length === 0) {
-  state = "key_input";
-  textInput = "";
-}
+  if (process.stdin.isTTY) {
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.on("keypress", handleKeypress);
+  } else {
+    console.error("zlink-demon requires a terminal (TTY)");
+    process.exit(1);
+  }
 
-render();
+  // Handle no saved keys — go straight to key input
+  if (savedKeys.length === 0) {
+    state = "key_input";
+    textInput = "";
+  }
+
+  render();
+})();
