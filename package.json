@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "chalk": "^5.3.0",
+    "hitmaker": "link:../hitmaker",
     "log-update": "^6.1.0"
   },
   "engines": {

@@ -109,90 +109,96 @@ const API_ENVIRONMENTS = [
 // Traffic Pool
 // ============================================================================
 
-function randInt(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Thin orchestration layer — all scheduling, concurrency, and pacing
+// is delegated to hitmaker's TrafficSimulator.start(). The pool only
+// manages the set of simulators and aggregates stats for the dashboard.
 function createPool() {
   const simulators = new Map();
   let isRunning = false;
-  let totalHits = 0;
-  let totalErrors = 0;
-  let phase = "waiting"; // waiting | active | idle
-  let phaseRate = 0;
-  let phaseEnd = 0;
+  let configRefreshInterval = null;
 
   async function addUrl(shortLink) {
     if (simulators.has(shortLink)) return;
     const sim = new TrafficSimulator(shortLink, getHitmakerConfig());
-    await sim.proxyPool.init();
     simulators.set(shortLink, sim);
+    // If pool is already running, start this simulator immediately
+    if (isRunning) {
+      sim.start().catch((err) => {
+        console.warn(`Sim start error [${shortLink}]: ${err.message}`);
+      });
+    }
   }
 
   async function start() {
     isRunning = true;
 
-    while (isRunning) {
-      // Re-read config each phase so hitmaker config changes take effect
+    // Start all existing simulators
+    for (const [url, sim] of simulators) {
+      sim.start().catch((err) => {
+        console.warn(`Sim start error [${url}]: ${err.message}`);
+      });
+    }
+
+    // Periodically push config changes into running simulators
+    // so hitmaker picks them up on the next worker loop iteration
+    configRefreshInterval = setInterval(() => {
       const cfg = getHitmakerConfig();
       for (const sim of simulators.values()) {
         sim.config = { ...sim.config, ...cfg };
       }
+    }, 10_000);
+  }
 
-      if (simulators.size === 0) {
-        phase = "waiting";
-        await sleep(1000);
-        continue;
-      }
-
-      const rate = randInt(cfg.MIN_PER_MIN, cfg.MAX_PER_MIN);
-      const activeMinutes = randInt(cfg.MIN_ACTIVE, cfg.MAX_ACTIVE);
-      phaseEnd = Date.now() + activeMinutes * 60_000;
-      phase = "active";
-      phaseRate = rate;
-
-      while (Date.now() < phaseEnd && isRunning) {
-        if (simulators.size === 0) { await sleep(1000); continue; }
-        const entries = Array.from(simulators.values());
-        const sim = entries[Math.floor(Math.random() * entries.length)];
-        const hitStart = Date.now();
-        try {
-          const result = await sim.doHit(1);
-          totalHits++;
-          if (!result.success) totalErrors++;
-        } catch { totalErrors++; }
-        // Subtract the time doHit took so we maintain the target rate
-        const hitDuration = Date.now() - hitStart;
-        const intervalMs = 60_000 / rate;
-        const jitter = intervalMs * (Math.random() * 0.2 - 0.1);
-        const remaining = intervalMs + jitter - hitDuration;
-        await sleep(Math.max(50, remaining));
-      }
-
-      if (Math.random() < cfg.IDLE_ODDS && isRunning) {
-        const idleMinutes = randInt(cfg.MIN_IDLE, cfg.MAX_IDLE);
-        phaseEnd = Date.now() + idleMinutes * 60_000;
-        phase = "idle";
-        phaseRate = 0;
-        while (Date.now() < phaseEnd && isRunning) await sleep(1000);
-      }
+  function stop() {
+    isRunning = false;
+    if (configRefreshInterval) clearInterval(configRefreshInterval);
+    for (const sim of simulators.values()) {
+      sim.stop();
     }
   }
 
-  function stop() { isRunning = false; }
-
+  // Aggregate stats from all simulators for the dashboard
   function getStats() {
+    let totalHits = 0;
+    let totalErrors = 0;
+    let activeWorkers = 0;
+    let totalWorkers = 0;
+    let aggregateRate = 0;
+    let nearestRemaining = Infinity;
+    let hasActive = false;
+    let hasIdle = false;
     const perUrl = {};
+
     for (const [url, sim] of simulators) {
       const s = sim.getStats();
+      totalHits += s.hitCounter;
+      totalErrors += s.errorCounter;
+      activeWorkers += s.activeWorkers;
+      totalWorkers += s.totalWorkers;
+      aggregateRate += s.phaseRate;
+      if (s.phase === "active") hasActive = true;
+      if (s.phase === "idle") hasIdle = true;
+      if (s.phaseRemaining > 0) {
+        nearestRemaining = Math.min(nearestRemaining, s.phaseRemaining);
+      }
       perUrl[url] = { hits: s.hitCounter, uniqueIps: s.uniqueIps };
     }
-    const phaseRemaining = Math.max(0, Math.ceil((phaseEnd - Date.now()) / 60_000));
-    return { totalHits, totalErrors, urlCount: simulators.size, perUrl, phase, phaseRate, phaseRemaining };
+
+    let phase;
+    if (hasActive) phase = "active";
+    else if (hasIdle) phase = "idle";
+    else phase = "waiting";
+
+    return {
+      totalHits, totalErrors, urlCount: simulators.size, perUrl,
+      phase, phaseRate: aggregateRate,
+      phaseRemaining: nearestRemaining === Infinity ? 0 : nearestRemaining,
+      activeWorkers, totalWorkers,
+    };
   }
 
   return { addUrl, start, stop, getStats };
@@ -546,7 +552,7 @@ function renderDurationSelect() {
 }
 
 function renderRunning() {
-  const stats = pool ? pool.getStats() : { totalHits: 0, totalErrors: 0, urlCount: 0, perUrl: {}, phase: "starting", phaseRate: 0, phaseRemaining: 0 };
+  const stats = pool ? pool.getStats() : { totalHits: 0, totalErrors: 0, urlCount: 0, perUrl: {}, phase: "starting", phaseRate: 0, phaseRemaining: 0, activeWorkers: 0, totalWorkers: 0 };
   const lines = ["", renderHeader()];
 
   // Status bar
@@ -556,10 +562,13 @@ function renderRunning() {
 
   const modeLabel = includeExisting ? chalk.magenta("all") : chalk.dim("new");
   const phaseIcon = stats.phase === "active" ? chalk.green("●") : stats.phase === "idle" ? chalk.yellow("○") : chalk.gray("◌");
+  const workerLabel = stats.totalWorkers > 1
+    ? chalk.dim(` [${stats.activeWorkers}/${stats.totalWorkers}]`)
+    : "";
   const phaseLabel = stats.phase === "active"
-    ? chalk.green(`Active ~${stats.phaseRate}/min (${stats.phaseRemaining}min)`)
+    ? chalk.green(`Active ~${stats.phaseRate}/min`) + workerLabel + chalk.green(` (${stats.phaseRemaining}min)`)
     : stats.phase === "idle"
-      ? chalk.yellow(`Idle (${stats.phaseRemaining}min)`)
+      ? chalk.yellow(`Idle`) + workerLabel + chalk.yellow(` (${stats.phaseRemaining}min)`)
       : chalk.gray("Waiting for links...");
 
   lines.push(
@@ -743,13 +752,15 @@ function startDaemon() {
   poller = createPoller(apiUrl, apiKey, selectedWorkspaces);
   pool = createPool();
 
-  // Suppress doHit console output (we show stats in our dashboard instead)
+  // Suppress hitmaker's console output (we show stats in our dashboard instead).
+  // Hitmaker logs from doHit (W1, W2, ...), start(), stop(), and workerLoop
+  // are captured into the on-screen log buffer rather than printed directly.
   const origLog = console.log;
   const origWarn = console.warn;
+  const hitmakerLogPattern = /^.*(W\d+ |Starting traffic|Stopping simulator|Config:|\[pool\])/;
   console.log = (...args) => {
     const msg = args.join(" ");
-    // Capture simulator output as logs but don't print
-    if (msg.includes("W1 ") || msg.includes("[pool]")) {
+    if (hitmakerLogPattern.test(msg)) {
       addLog(msg.slice(0, 100));
       return;
     }
