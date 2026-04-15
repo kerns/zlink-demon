@@ -90,9 +90,8 @@ function pad(str, width) {
 // API helpers
 // ============================================================================
 
-async function apiRequest(apiUrl, path, apiKey, workspaceSlug = null) {
+async function apiRequest(apiUrl, path, apiKey) {
   const headers = { Authorization: `Bearer ${apiKey}` };
-  if (workspaceSlug) headers["X-Workspace"] = workspaceSlug;
   const res = await fetch(`${apiUrl}${path}`, { headers });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -102,8 +101,8 @@ async function apiRequest(apiUrl, path, apiKey, workspaceSlug = null) {
 }
 
 const API_ENVIRONMENTS = [
-  { name: "dev", url: "https://dev-api.zeblink.io/api" },
-  { name: "prod", url: "https://api.zeblink.io/api" },
+  { name: "dev", url: "https://dev-api.zeblink.io/v1" },
+  { name: "prod", url: "https://api.zeblink.io/v1" },
 ];
 
 // ============================================================================
@@ -203,26 +202,26 @@ function createPool() {
 // Poller
 // ============================================================================
 
-function createPoller(apiUrl, apiKey, workspaceSlugs) {
+function createPoller(apiUrl, apiKey, workspaces) {
   const seenIds = new Set();
   const timestamps = {};
-  for (const slug of workspaceSlugs) timestamps[slug] = new Date().toISOString();
+  for (const ws of workspaces) timestamps[ws.id] = new Date().toISOString();
 
   async function poll() {
     const newLinks = [];
-    for (const slug of workspaceSlugs) {
+    for (const ws of workspaces) {
       try {
         const params = new URLSearchParams({
-          createdAfter: timestamps[slug], sortBy: "createdAt", sortOrder: "asc", limit: "100",
+          createdAfter: timestamps[ws.id], sortBy: "createdAt", sortOrder: "asc", limit: "100",
         });
-        const body = await apiRequest(apiUrl, `/links?${params}`, apiKey, slug);
+        const body = await apiRequest(apiUrl, `/workspaces/${ws.id}/links?${params}`, apiKey);
         const links = body.data || [];
         for (const link of links) {
           if (seenIds.has(link.id)) continue;
           seenIds.add(link.id);
-          newLinks.push({ id: link.id, shortLink: link.shortLink, workspace: slug });
+          newLinks.push({ id: link.id, shortLink: link.shortLink, workspace: ws.slug });
         }
-        if (links.length > 0) timestamps[slug] = links[links.length - 1].createdAt;
+        if (links.length > 0) timestamps[ws.id] = links[links.length - 1].createdAt;
       } catch {}
     }
     return newLinks;
@@ -737,13 +736,11 @@ function transitionToWorkspaceSelect() {
 }
 
 function startDaemon() {
-  const workspaceSlugs = selectedWorkspaces.map((ws) => ws.slug);
-
   logUpdate.clear();
   state = "running";
   startTime = Date.now();
 
-  poller = createPoller(apiUrl, apiKey, workspaceSlugs);
+  poller = createPoller(apiUrl, apiKey, selectedWorkspaces);
   pool = createPool();
 
   // Suppress doHit console output (we show stats in our dashboard instead)
@@ -769,7 +766,7 @@ function startDaemon() {
         try {
           addLog(`Fetching existing links for ${ws.slug}...`);
           const params = new URLSearchParams({ sortBy: "createdAt", sortOrder: "desc", limit: "100" });
-          const body = await apiRequest(apiUrl, `/links?${params}`, apiKey, ws.slug);
+          const body = await apiRequest(apiUrl, `/workspaces/${ws.id}/links?${params}`, apiKey);
           const links = body.data || [];
           for (const link of links) {
             let url = link.shortLink;
